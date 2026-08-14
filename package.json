@@ -1,0 +1,19 @@
+{
+  "name": "book-illustration-studio",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Book Illustration Studio — Gradion take-home (FastAPI + React)",
+  "scripts": {
+    "start": "./start.sh",
+    "test": "./test.sh",
+    "dev:backend": "cd backend && .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "test:backend": "cd backend && .venv/bin/pytest",
+    "test:frontend": "npm --prefix frontend test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/baondg/GradionProject.git"
+  },
+  "license": "MIT"
+}
