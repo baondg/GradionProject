@@ -16,6 +16,13 @@ BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 
+# Activate backend/.venv so uvicorn/python on PATH are the project ones.
+# `activate` can reference unset vars; relax -u around the source.
+set +u
+# shellcheck disable=SC1091
+source "$VENV/bin/activate"
+set -u
+
 backend_pid=""
 frontend_pid=""
 
@@ -32,7 +39,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cd "$ROOT/backend"
-"$VENV/bin/uvicorn" app.main:app \
+uvicorn app.main:app \
   --host "$BACKEND_HOST" \
   --port "$BACKEND_PORT" \
   --workers 1 &

@@ -14,6 +14,7 @@ from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from app.gemini import GeminiConfigError, RealGeminiClient
 from app.state import STEPS, can_claim, next_step, to_view
 from app.storage import Storage
 
@@ -37,23 +38,45 @@ class IdentifyIn(BaseModel):
 
 
 class UnconfiguredGemini:
+    def load_session(
+        self,
+        gemini_doc: dict[str, Any] | None = None,
+        *,
+        style: str | None = None,
+    ) -> None:
+        del gemini_doc, style
+
+    def dump_session(self) -> dict[str, Any]:
+        return {"file_id": None, "interaction_id": None}
+
     def send_book(self, text: str) -> None:
-        raise RuntimeError("Gemini is not configured")
+        raise RuntimeError("OPENROUTER_API_KEY is missing. Copy .env.example to .env.")
 
     def style(self, user_style: str | None = None) -> str:
-        raise RuntimeError("Gemini is not configured")
+        raise RuntimeError("OPENROUTER_API_KEY is missing. Copy .env.example to .env.")
 
     def characters(self) -> list[dict]:
-        raise RuntimeError("Gemini is not configured")
+        raise RuntimeError("OPENROUTER_API_KEY is missing. Copy .env.example to .env.")
 
     def portraits(self, characters: list[dict]) -> list[bytes]:
-        raise RuntimeError("Gemini is not configured")
+        raise RuntimeError("OPENROUTER_API_KEY is missing. Copy .env.example to .env.")
 
     def chapters(self) -> list[dict]:
-        raise RuntimeError("Gemini is not configured")
+        raise RuntimeError("OPENROUTER_API_KEY is missing. Copy .env.example to .env.")
 
-    def illustrations(self, chapters: list[dict]) -> list[bytes]:
-        raise RuntimeError("Gemini is not configured")
+    def illustrations(
+        self,
+        chapters: list[dict],
+        portraits: list[bytes] | None = None,
+    ) -> list[bytes]:
+        raise RuntimeError("OPENROUTER_API_KEY is missing. Copy .env.example to .env.")
+
+
+def default_gemini() -> Any:
+    try:
+        return RealGeminiClient.from_env()
+    except GeminiConfigError:
+        return UnconfiguredGemini()
 
 
 def _error_body(code: str, message: str) -> dict[str, Any]:
@@ -111,9 +134,15 @@ def _detail_view(doc: dict[str, Any], boot_id: str, book_text: str) -> dict[str,
     return view
 
 
-def _mark_book_sent(doc: dict[str, Any]) -> None:
-    gemini_state = doc.setdefault("gemini", {})
-    gemini_state["file_id"] = gemini_state.get("file_id") or "uploaded"
+def _persist_gemini_session(doc: dict[str, Any], gemini: Any) -> dict[str, Any]:
+    dump = getattr(gemini, "dump_session", None)
+    if dump is None:
+        return doc
+    slot = doc.setdefault("gemini", {})
+    for key, value in dump().items():
+        if value is not None:
+            slot[key] = value
+    return doc
 
 
 def _finish_ok(doc: dict[str, Any], claimed_boot: str, step: str) -> dict[str, Any]:
@@ -222,14 +251,16 @@ def create_app(
         try:
             book_text = _read_book(storage, project_id)
             current = storage.load_project(project_id)
+            loader = getattr(gemini, "load_session", None)
+            if loader is not None:
+                loader(current.get("gemini"), style=current.get("style"))
+
+            def persist(doc: dict[str, Any]) -> dict[str, Any]:
+                return _persist_gemini_session(doc, gemini)
+
             if not (current.get("gemini") or {}).get("file_id"):
                 gemini.send_book(book_text)
-
-                def mark_sent(doc: dict[str, Any]) -> dict[str, Any]:
-                    _mark_book_sent(doc)
-                    return doc
-
-                storage.update_project(project_id, mark_sent)
+                storage.update_project(project_id, persist)
 
             if step == "style":
                 text = gemini.style(user_style)
@@ -239,6 +270,7 @@ def create_app(
                         return doc
                     doc["style"] = text
                     doc["style_source"] = "user" if user_style else "generated"
+                    persist(doc)
                     return _finish_ok(doc, claimed_boot, "style")
 
                 storage.update_project(project_id, apply)
@@ -259,6 +291,7 @@ def create_app(
                     if doc.get("run_boot_id") != claimed_boot:
                         return doc
                     doc["characters"] = chars
+                    persist(doc)
                     return _finish_ok(doc, claimed_boot, "characters")
 
                 storage.update_project(project_id, apply)
@@ -285,13 +318,14 @@ def create_app(
                             return current
                         if i < len(current.get("characters") or []):
                             current["characters"][i]["portrait_path"] = relative
+                        persist(current)
                         return current
 
                     storage.update_project(project_id, set_path)
 
                 storage.update_project(
                     project_id,
-                    lambda d: _finish_ok(d, claimed_boot, "portraits"),
+                    lambda d: persist(_finish_ok(d, claimed_boot, "portraits")),
                 )
                 return
 
@@ -310,6 +344,7 @@ def create_app(
                     if doc.get("run_boot_id") != claimed_boot:
                         return doc
                     doc["chapters"] = chapters
+                    persist(doc)
                     return _finish_ok(doc, claimed_boot, "chapters")
 
                 storage.update_project(project_id, apply)
@@ -318,7 +353,15 @@ def create_app(
             if step == "illustrations":
                 doc = storage.load_project(project_id)
                 chapters = list(doc.get("chapters") or [])
-                images = gemini.illustrations(chapters)
+                portrait_blobs: list[bytes] = []
+                for char in doc.get("characters") or []:
+                    rel = char.get("portrait_path")
+                    if not rel:
+                        continue
+                    path = _project_dir(storage, project_id) / rel
+                    if path.is_file():
+                        portrait_blobs.append(path.read_bytes())
+                images = gemini.illustrations(chapters, portraits=portrait_blobs)
                 ill_dir = _project_dir(storage, project_id) / "illustrations"
                 ill_dir.mkdir(parents=True, exist_ok=True)
                 for index, blob in enumerate(images[:MAX_CHAPTERS]):
@@ -336,13 +379,14 @@ def create_app(
                             return current
                         if i < len(current.get("chapters") or []):
                             current["chapters"][i]["illustration_path"] = relative
+                        persist(current)
                         return current
 
                     storage.update_project(project_id, set_path)
 
                 storage.update_project(
                     project_id,
-                    lambda d: _finish_ok(d, claimed_boot, "illustrations"),
+                    lambda d: persist(_finish_ok(d, claimed_boot, "illustrations")),
                 )
         except Exception as exc:  # noqa: BLE001 — step failure is a user-visible error
             storage.update_project(
@@ -508,6 +552,6 @@ def create_app(
 
 app = create_app(
     data_dir=ROOT / "data",
-    gemini=UnconfiguredGemini(),
+    gemini=default_gemini(),
     boot_id=str(uuid.uuid4()),
 )

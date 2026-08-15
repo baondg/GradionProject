@@ -4,9 +4,7 @@
 
 Tests run with **`./test.sh`** (pytest, then vitest). Either failure fails the script. Gemini is never called in tests — a fake client will be injected when the pipeline exists.
 
-**Backend (now):** HTTP health check so the FastAPI app actually boots in pytest.
-
-**Backend (next, per `docs/plan.md`):** step order, `can_claim` (live vs stale boot id), success/fail cursor, 2/1 caps, `to_view` action/stuck/pill; HTTP tests with a temp `data/` dir — 5-step happy path, concurrent duplicate POST → one 409, restart stuck on list **and** detail, fail/retry.
+**Backend:** step order, `can_claim`, `to_view`, storage flock, Gemini helpers (mocked SDK), HTTP tests with a temp `data/` dir — 5-step happy path, concurrent duplicate POST → one 409, restart stuck on list **and** detail, fail/retry. Fake Gemini is injected; no network.
 
 **Frontend (now):** the harness hello-world screen renders.
 
@@ -16,24 +14,15 @@ Tests run with **`./test.sh`** (pytest, then vitest). Either failure fails the s
 
 ## Harness smoke report
 
-Real run of `./test.sh` (2026-08-14). One pytest, one vitest, both passed.
+Real run of `./test.sh` (2026-08-15).
 
 ```
 ==> backend (pytest)
-.                                                                        [100%]
-=============================== warnings summary ===============================
-.venv/lib/python3.14/site-packages/fastapi/testclient.py:1
-  .../fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with
-  `starlette.testclient` is deprecated; install `httpx2` instead.
-
-1 passed, 1 warning in 0.17s
+................................................                         [100%]
+48 passed, 1 warning in 0.83s
 ==> frontend (vitest)
-
- RUN  v4.1.10
-
  Test Files  1 passed (1)
       Tests  1 passed (1)
-   Duration  731ms
 ```
 
-The Starlette/`httpx` deprecation is from FastAPI's TestClient, not our code. Leave it until the pipeline tests exist; do not add `httpx2` just to silence a warning.
+The Starlette/`httpx` deprecation is from FastAPI's TestClient, not our code. Do not add `httpx2` just to silence it.

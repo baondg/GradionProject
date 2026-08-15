@@ -1,6 +1,5 @@
 """HTTP integration tests for the FastAPI API. Spec: docs/plan.md §4–5, §8.1.
 
-Expects create_app(data_dir=, gemini=, boot_id=) — not implemented yet (red).
 Fake Gemini is injected; no network. Each test gets a temporary data dir.
 """
 
@@ -14,6 +13,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from app.gemini import FakeGeminiClient as FakeGemini
 from app.main import create_app
 from app.storage import Storage
 
@@ -22,64 +22,6 @@ NAME = "Mira Hassan"
 BOOT_ID = "test-boot"
 BOOK = "The Mole had been working very hard all the morning."
 STEPS = ("style", "characters", "portraits", "chapters", "illustrations")
-
-
-class FakeGemini:
-    """In-memory Gemini. Pipeline must call send_book once, then one method per step."""
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-        self.book_sends = 0
-        self.fail_steps: set[str] = set()
-        self.entered = threading.Event()
-        self._hold = threading.Event()
-        self._hold.set()
-
-    def block(self) -> None:
-        self.entered.clear()
-        self._hold.clear()
-
-    def unblock(self) -> None:
-        self._hold.set()
-
-    def _trace(self, step: str) -> None:
-        self.calls.append(step)
-        self.entered.set()
-        assert self._hold.wait(timeout=5), "fake Gemini held too long"
-        if step in self.fail_steps:
-            raise RuntimeError(f"fake Gemini failed on {step}")
-
-    def send_book(self, text: str) -> None:
-        self.book_sends += 1
-        self.book_text = text
-
-    def style(self, user_style: str | None = None) -> str:
-        self._trace("style")
-        return user_style or "Warm, hand-painted watercolour with soft ink outlines."
-
-    def characters(self) -> list[dict]:
-        self._trace("characters")
-        return [
-            {"name": "Mole", "prompt": "A mole in a dark waistcoat, storybook watercolour."},
-            {"name": "Rat", "prompt": "A water rat with a straw hat, at the river bank."},
-        ]
-
-    def portraits(self, characters: list[dict]) -> list[bytes]:
-        self._trace("portraits")
-        return [f"png:{c['name']}".encode() for c in characters]
-
-    def chapters(self) -> list[dict]:
-        self._trace("chapters")
-        return [
-            {
-                "name": "Opening Scene",
-                "prompt": "Mole and Rat on the river bank, established style.",
-            }
-        ]
-
-    def illustrations(self, chapters: list[dict]) -> list[bytes]:
-        self._trace("illustrations")
-        return [f"png:{c['name']}".encode() for c in chapters]
 
 
 @dataclass

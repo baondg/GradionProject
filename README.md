@@ -6,13 +6,13 @@ Web app that turns book text into character portraits and a chapter illustration
 
 - Python 3.11+ (`python3`)
 - Node.js 20+ and npm
-- A Gemini API key (not needed for the harness smoke tests)
+- An OpenRouter API key (not needed for the harness smoke tests)
 
 ## Setup
 
 ```bash
 cp .env.example .env
-# fill in GEMINI_API_KEY and model IDs when you run real generation
+# fill in OPENROUTER_API_KEY and model IDs when you run real generation
 ```
 
 `./start.sh` and `./test.sh` create the Python venv and install dependencies on first run.
@@ -35,7 +35,7 @@ Vite proxies `/api` to the backend. No Docker — state will live as JSON files 
 
 ## Env vars
 
-See `.env.example`. Required later for generation: `GEMINI_API_KEY`, `GEMINI_TEXT_MODEL`, `GEMINI_IMAGE_MODEL`. Optional: `BACKEND_HOST`, `BACKEND_PORT`, `FRONTEND_PORT`.
+See `.env.example`. Required later for generation: `OPENROUTER_API_KEY`, `GEMINI_TEXT_MODEL`, `GEMINI_IMAGE_MODEL`. Optional: `BACKEND_HOST`, `BACKEND_PORT`, `FRONTEND_PORT`.
 
 ## Architecture (short)
 
