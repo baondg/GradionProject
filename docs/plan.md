@@ -470,7 +470,6 @@ Resolve at implementation time; record in `DECISIONS.md` if the answer is a real
 6. **SPA in production-like start:** Vite dev + proxy is enough for reviewers; serving `frontend/dist` from FastAPI is optional.
 7. **`GET /me` on boot:** client has persisted email; still call `/me` to refresh name, or trust local persistence.
 8. **Worker fence (`run_id` vs `run_boot_id` only):** boot id is enough for crash-only. A per-claim uuid is extra safety for late writes; add only if the worker can outlive a recover in the same process (it should not, given A1).
-9. **Rename `DECISION.md` → `DECISIONS.md`** to match the brief.
 
 ---
 
