@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -14,7 +15,7 @@ from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from app.gemini import GeminiConfigError, RealGeminiClient
+from app.gemini import FakeGeminiClient, GeminiConfigError, RealGeminiClient
 from app.state import STEPS, can_claim, next_step, to_view
 from app.storage import Storage
 
@@ -72,7 +73,15 @@ class UnconfiguredGemini:
         raise RuntimeError("OPENROUTER_API_KEY is missing. Copy .env.example to .env.")
 
 
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def default_gemini() -> Any:
+    # Same public methods as RealGeminiClient. Flip this off once OpenRouter
+    # has credit; routes, claim/lock, and session dump stay unchanged.
+    if _truthy(os.environ.get("USE_FAKE_GEMINI")):
+        return FakeGeminiClient()
     try:
         return RealGeminiClient.from_env()
     except GeminiConfigError:
