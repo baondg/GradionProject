@@ -76,3 +76,25 @@ def to_view(doc: dict[str, Any], boot_id: str) -> dict[str, Any]:
         "steps": steps,
         "error": doc.get("error"),
     }
+
+
+def attempts_view(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """Detail-only wire rows. Missing `attempts` on old files → []."""
+    rows: list[dict[str, Any]] = []
+    for entry in doc.get("attempts") or []:
+        if not isinstance(entry, dict):
+            continue
+        step = entry.get("step")
+        outcome = entry.get("outcome")
+        if step not in STEPS or outcome not in ("success", "failed"):
+            continue
+        message = entry.get("message")
+        rows.append(
+            {
+                "step": step,
+                "at": str(entry.get("at") or ""),
+                "outcome": outcome,
+                "message": None if message is None else str(message),
+            }
+        )
+    return rows

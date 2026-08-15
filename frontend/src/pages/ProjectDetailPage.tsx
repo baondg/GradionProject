@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react"
 import { Link, useNavigate, useParams } from "react-router-dom"
 import { ApiError, getProject, runStep } from "../api"
 import { useAuth } from "../auth"
+import { AttemptHistory } from "../components/AttemptHistory"
 import { BookTextModal } from "../components/BookTextModal"
 import { ChapterCard } from "../components/ChapterCard"
 import { CharacterCard } from "../components/CharacterCard"
@@ -142,6 +143,7 @@ export function ProjectDetailPage() {
               <p className="snippet">{snippet(project.book_text, 220)}</p>
             </div>
           )}
+          <AttemptHistory attempts={project.attempts ?? []} />
         </aside>
       </div>
       {bookOpen ? (

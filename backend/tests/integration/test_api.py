@@ -185,6 +185,7 @@ def test_list_projects_empty_then_one(identified: Harness) -> None:
     assert row["action"] == "run"
     assert row["stuck"] is False
     assert "book_text" not in row
+    assert "attempts" not in row
     assert "run_boot_id" not in row
 
 
@@ -224,6 +225,8 @@ def test_five_step_happy_path(identified: Harness) -> None:
     assert done["action"] == "none"
     assert done["run"] == "idle"
     assert done["chapters"][0]["illustration_url"]
+    assert [row["step"] for row in done["attempts"]] == list(STEPS)
+    assert [row["outcome"] for row in done["attempts"]] == ["success"] * 5
 
     assert identified.fake_gemini.book_sends == 1
     assert identified.fake_gemini.calls == list(STEPS)
@@ -323,10 +326,14 @@ def test_step_failure_then_retry(identified: Harness) -> None:
     assert failed["current_step"] == "style"
     assert failed["error"] is not None
     assert failed["error"]["message"]
+    assert [row["outcome"] for row in failed["attempts"]] == ["failed"]
+    assert failed["attempts"][0]["step"] == "style"
+    assert failed["attempts"][0]["message"]
 
     identified.fake_gemini.fail_steps.clear()
     retried = _run_step(identified, project_id, "style")
     assert retried["run"] == "idle"
     assert retried["completed_step"] == "style"
     assert retried["error"] is None
+    assert [row["outcome"] for row in retried["attempts"]] == ["failed", "success"]
     assert identified.fake_gemini.calls.count("style") == 2

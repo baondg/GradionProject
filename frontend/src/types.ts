@@ -25,12 +25,20 @@ export type ProjectListItem = {
   error: { code: string; message: string } | null
 }
 
+export type Attempt = {
+  step: StepKey
+  at: string
+  outcome: "success" | "failed"
+  message: string | null
+}
+
 export type ProjectDetail = ProjectListItem & {
   book_text: string
   style: string | null
   style_source: "user" | "generated" | null
   characters: { name: string; prompt: string; portrait_url: string | null }[]
   chapters: { name: string; prompt: string; illustration_url: string | null }[]
+  attempts: Attempt[]
 }
 
 export const STEP_LABELS: Record<StepKey, string> = {

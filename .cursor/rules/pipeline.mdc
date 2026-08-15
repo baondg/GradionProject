@@ -1,0 +1,43 @@
+---
+description: Pipeline constraints — caps, no auto-retry, boot-id recovery
+alwaysApply: true
+---
+
+# Pipeline constraints
+
+Source of truth: `docs/plan.md`. Do not invent a sixth step, a generic step engine, or a second progress model.
+
+## Caps (server-side)
+
+- Persist at most **2 characters** and **1 chapter**.
+- After Gemini structured output, **truncate**. Do not fail the step for extra items.
+- Do not rely on the UI to enforce caps.
+
+## Order and admission
+
+```
+none → style → characters → portraits → chapters → illustrations
+```
+
+- A named step POST may run only if it is `next(completed_step)`.
+- `can_claim` is the only gate: `idle`, `failed`, or `running` with a **stale** `run_boot_id`.
+- Live `running` + this process `BOOT_ID` → 409 `in_flight`. Wrong step → 409 `wrong_step`.
+
+## No auto-retry
+
+- One Gemini / OpenRouter attempt per user click.
+- Never loop on failure, timeout, or 429/402.
+- Retry and recover are the **same POST** as run for `current_step`.
+
+## Boot-id recovery (A1)
+
+- Mint `BOOT_ID` once per process. Write it as `run_boot_id` when claiming.
+- `stuck = (run == running && run_boot_id != BOOT_ID)`. Never store `stuck`.
+- GET / list are **read-only**. No repair-on-read. No startup sweep. No wall-clock timeout that re-fires Gemini.
+- After claim: persist `running` under the flock, **release the lock**, then call Gemini in a thread.
+
+## Session and wire
+
+- Send book text **once**; reuse `doc.gemini` on later steps.
+- Never put `run_boot_id`, `gemini.*`, or filesystem paths on the wire.
+- `to_view()` is the only serializer. React switches the button on `action` only.

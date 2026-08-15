@@ -1,7 +1,11 @@
-"""Gemini pipeline client via OpenRouter. Spec: docs/plan.md §7; notebook steps 1–5.
+"""Gemini clients (real SDK + test fake). Spec: docs/plan.md §7.
 
-OpenRouter is the provider (OpenAI-compatible chat + Image API). The public
-methods stay the same so FastAPI and FakeGeminiClient do not change.
+Pipeline is the cookbook notebook steps 1–5 only:
+https://github.com/google-gemini/cookbook/blob/main/examples/Book_illustration.ipynb
+
+Uses ``google-genai`` (``from google import genai``): ``files.upload`` plus
+``interactions.create`` with ``previous_interaction_id``. Caps (max 2
+characters, max 1 chapter) are assignment limits, not the notebook's.
 """
 
 from __future__ import annotations
@@ -10,49 +14,81 @@ import base64
 import json
 import os
 import re
+import tempfile
 import threading
 from typing import Any, NoReturn
 
-DEFAULT_TEXT_MODEL = "google/gemini-2.5-flash"
-DEFAULT_IMAGE_MODEL = "stabilityai/stable-diffusion-3"
-DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+from pydantic import BaseModel
+
+# Notebook defaults (Select models cell). Override with GEMINI_*_MODEL.
+DEFAULT_TEXT_MODEL = "gemini-3.7-flash"
+DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-lite-image"
 MAX_CHARACTERS = 2
 MAX_CHAPTERS = 1
 
+# 1×1 PNG so FakeGemini portraits/illustrations are displayable in <img>.
+FAKE_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d4944415478da63fccfc0500f000485018084a98c210000000049454e44ae426082"
+)
+
+# Notebook ``system_instructions`` cell — used on the image chain, not as SDK system_instruction.
 SYSTEM_INSTRUCTIONS = """
-There must be no text on the image, it should not look like a cover page.
-It should be a full illustration with no borders, titles, nor description.
-Unless asked otherwise, stay family-friendly with uplifting colors.
-Each product should be a simple image, no panels.
+ There must be no text on the image, it should not look like a cover page.
+ It should be an full illustration with no borders, titles, nor description.
+ Unless asked otherwise, stay family-friendly with uplifting colors.
+ Each produced should be a simple image, no panels.
 """
 
-PROMPT_ITEM_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "name": {"type": "string"},
-        "prompt": {"type": "string"},
-    },
-    "required": ["name", "prompt"],
-    "additionalProperties": False,
-}
+BOOK_INTRO = (
+    "Here's a book, to illustrate using Nano Banana. "
+    "Don't say anything for now, instructions will follow."
+)
 
-# OpenRouter strict json_schema wants an object, not a top-level array.
-PROMPT_OBJECT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "items": {"type": "array", "items": PROMPT_ITEM_SCHEMA},
-    },
-    "required": ["items"],
-    "additionalProperties": False,
-}
+STYLE_GENERATE_PROMPT = (
+    "Can you define a art style that would fit the story but with a twist? "
+    "Just give us the prompt for the art syle that will added to the furture prompts."
+)
 
-JSON_SCHEMA_FORMAT: dict[str, Any] = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "prompt_list",
-        "strict": True,
-        "schema": PROMPT_OBJECT_SCHEMA,
-    },
+CHARACTERS_PROMPT = (
+    "Can you describe the main characters (only the adults) and prepare a prompt "
+    "describing them with as much details as possible (use the descriptions from "
+    "the book) so Nano Banana can generate images of them? Each prompt should be "
+    "at least 50 words."
+)
+
+CHAPTERS_PROMPT = (
+    "Now, for each chapters of the book, give me a prompt to illustrate what "
+    "happens in it. It should be a single image, not a multi-tiled page. Be "
+    "very descriptive, especially of the characters. Be very descriptive and "
+    "remember to tell their name and to reuse the character prompts if they "
+    "appear in the images. Also list all characters who appear in it."
+)
+
+PORTRAIT_SETUP_PROMPT = """
+ You are going to generate portrait images to illustrate this book.
+ The style we want you to follow is: {style}
+ Also follow those rules: {system_instructions}
+ """
+
+CHAPTER_SETUP_PROMPT = (
+    "Starting from now, we're going to illustrate the book's chapters. Don't "
+    "forget to refer to your previous illustrations of the characters to keep "
+    "the characters consistency, but feel free to change their position."
+)
+
+
+class Prompt(BaseModel):
+    """Notebook structured-output row: name + image prompt."""
+
+    name: str
+    prompt: str
+
+
+PROMPT_LIST_FORMAT: dict[str, Any] = {
+    "type": "text",
+    "mime_type": "application/json",
+    "schema": {"type": "array", "items": Prompt.model_json_schema()},
 }
 
 
@@ -130,7 +166,7 @@ class FakeGeminiClient:
 
     def portraits(self, characters: list[dict]) -> list[bytes]:
         self._trace("portraits")
-        return [f"png:{c['name']}".encode() for c in characters]
+        return [FAKE_PNG for _ in characters]
 
     def chapters(self) -> list[dict]:
         self._trace("chapters")
@@ -149,12 +185,14 @@ class FakeGeminiClient:
     ) -> list[bytes]:
         del portraits
         self._trace("illustrations")
-        return [f"png:{c['name']}".encode() for c in chapters]
+        return [FAKE_PNG for _ in chapters]
 
 
 class RealGeminiClient:
-    """OpenRouter-backed client. One HTTP attempt per call. Session lives on a
-    thread-local so two projects in the pool cannot clobber each other's history.
+    """Notebook pipeline via google-genai Files + Interactions.
+
+    Session IDs live on a thread-local so two projects in the pool cannot
+    clobber each other. One ``interactions.create`` per call — no SDK retry loop.
     """
 
     def __init__(
@@ -163,34 +201,32 @@ class RealGeminiClient:
         api_key: str,
         text_model: str = DEFAULT_TEXT_MODEL,
         image_model: str = DEFAULT_IMAGE_MODEL,
-        base_url: str = DEFAULT_BASE_URL,
-        http: Any | None = None,
+        sdk: Any | None = None,
     ) -> None:
         key = (api_key or "").strip()
         if not key:
             raise GeminiConfigError(
-                "OPENROUTER_API_KEY is missing. Copy .env.example to .env and set a key "
-                "from https://openrouter.ai/keys"
+                "GEMINI_API_KEY is missing. Copy .env.example to .env and set a key "
+                "from https://aistudio.google.com/apikey"
             )
         self.api_key = key
         self.text_model = _normalize_model(text_model, DEFAULT_TEXT_MODEL)
         self.image_model = _normalize_model(image_model, DEFAULT_IMAGE_MODEL)
-        self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self._tls = threading.local()
-        if http is not None:
-            self._http = http
+        if sdk is not None:
+            self._sdk = sdk
         else:
-            import httpx
+            from google import genai
 
-            self._http = httpx.Client(timeout=120.0)
+            # Notebook enables HttpRetryOptions(attempts=5). Plan forbids auto-retry.
+            self._sdk = genai.Client(api_key=key)
 
     @classmethod
     def from_env(cls) -> RealGeminiClient:
         return cls(
-            api_key=os.environ.get("OPENROUTER_API_KEY") or os.environ.get("GEMINI_API_KEY", ""),
+            api_key=os.environ.get("GEMINI_API_KEY", ""),
             text_model=os.environ.get("GEMINI_TEXT_MODEL") or DEFAULT_TEXT_MODEL,
             image_model=os.environ.get("GEMINI_IMAGE_MODEL") or DEFAULT_IMAGE_MODEL,
-            base_url=os.environ.get("OPENROUTER_BASE_URL") or DEFAULT_BASE_URL,
         )
 
     def load_session(
@@ -204,10 +240,8 @@ class RealGeminiClient:
         self._tls.file_uri = data.get("file_uri")
         self._tls.interaction_id = data.get("interaction_id")
         self._tls.image_interaction_id = data.get("image_interaction_id")
-        self._tls.text_messages = list(data.get("text_messages") or [])
-        self._tls.image_messages = list(data.get("image_messages") or [])
         self._tls.style = style
-        self._tls.portraits = []
+        self._tls.portraits: list[bytes] = []
 
     def dump_session(self) -> dict[str, Any]:
         return {
@@ -215,106 +249,105 @@ class RealGeminiClient:
             "file_uri": getattr(self._tls, "file_uri", None),
             "interaction_id": getattr(self._tls, "interaction_id", None),
             "image_interaction_id": getattr(self._tls, "image_interaction_id", None),
-            "text_messages": getattr(self._tls, "text_messages", None),
-            "image_messages": getattr(self._tls, "image_messages", None),
         }
 
     def send_book(self, text: str) -> None:
         self._ensure_session()
-        if not (text or "").strip():
-            raise GeminiError("Book text is empty; cannot send to OpenRouter.")
-        user = (
-            "Here's a book, to illustrate using Nano Banana. "
-            "Don't say anything for now, instructions will follow.\n\n"
-            f"{text.strip()}"
-        )
-        reply, response_id = self._chat(
-            [{"role": "user", "content": user}],
+        body = (text or "").strip()
+        if not body:
+            raise GeminiError("Book text is empty; cannot send to Gemini.")
+        uploaded = self._upload_book(body)
+        self._tls.file_id = getattr(uploaded, "name", None) or getattr(uploaded, "id", None)
+        self._tls.file_uri = getattr(uploaded, "uri", None)
+        if not self._tls.file_uri:
+            raise GeminiError("Gemini file upload returned no URI.")
+        interaction = self._interact(
             model=self.text_model,
+            input=[
+                {"type": "text", "text": BOOK_INTRO},
+                {"type": "document", "uri": self._tls.file_uri},
+            ],
         )
-        self._tls.text_messages = [
-            {"role": "user", "content": user},
-            {"role": "assistant", "content": reply or "OK"},
-        ]
-        self._tls.file_id = "openrouter:book"
-        self._tls.file_uri = "openrouter:book"
-        self._tls.interaction_id = response_id
+        self._tls.interaction_id = interaction.id
 
     def style(self, user_style: str | None = None) -> str:
-        self._require_text_session()
+        previous = self._require_text_session()
         if user_style and user_style.strip():
             chosen = user_style.strip()
             prompt = (
                 f'The art style will be:"{chosen}". Keep that in mind when '
                 "generating future prompts. Keep quiet for now, instructions will follow."
             )
-            reply, response_id = self._chat_next(prompt, max_tokens=1024)
-            self._tls.interaction_id = response_id
+            interaction = self._interact(
+                model=self.text_model,
+                input=prompt,
+                previous_interaction_id=previous,
+            )
+            self._tls.interaction_id = interaction.id
             self._tls.style = chosen
             return chosen
 
-        prompt = (
-            "Can you define an art style that would fit the story but with a twist? "
-            "Just give us the prompt for the art style that will be added to future prompts."
+        interaction = self._interact(
+            model=self.text_model,
+            input=STYLE_GENERATE_PROMPT,
+            previous_interaction_id=previous,
         )
-        reply, response_id = self._chat_next(prompt, max_tokens=1024)
-        self._tls.interaction_id = response_id
+        self._tls.interaction_id = interaction.id
+        reply = _interaction_text(interaction)
         if not reply:
-            raise GeminiError("OpenRouter returned an empty art style.")
+            raise GeminiError("Gemini returned an empty art style.")
         self._tls.style = reply
         return reply
 
     def characters(self) -> list[dict]:
-        self._require_text_session()
-        prompt = (
-            "Can you describe the main characters (only the adults) and prepare a prompt "
-            "describing them with as much detail as possible (use the descriptions from "
-            "the book) so Nano Banana can generate images of them? Each prompt should be "
-            "at least 50 words. Exclude children."
+        previous = self._require_text_session()
+        interaction = self._interact(
+            model=self.text_model,
+            input=CHARACTERS_PROMPT,
+            previous_interaction_id=previous,
+            response_format=PROMPT_LIST_FORMAT,
         )
-        reply, response_id = self._chat_next(
-            prompt,
-            response_format=JSON_SCHEMA_FORMAT,
-            max_tokens=2048,
-        )
-        self._tls.interaction_id = response_id
-        return _parse_prompt_list(reply, limit=MAX_CHARACTERS)
+        self._tls.interaction_id = interaction.id
+        return _parse_prompt_list(_interaction_text(interaction), limit=MAX_CHARACTERS)
 
     def portraits(self, characters: list[dict]) -> list[bytes]:
         self._ensure_session()
         style = getattr(self._tls, "style", None) or ""
-        style_line = f'Follow this style: "{style}"' if style else ""
+        styled = f'Follow this style: "{style}" ' if style else style
+        setup = self._interact(
+            model=self.image_model,
+            input=PORTRAIT_SETUP_PROMPT.format(
+                style=styled,
+                system_instructions=SYSTEM_INSTRUCTIONS,
+            ),
+        )
+        self._tls.image_interaction_id = setup.id
         images: list[bytes] = []
         for character in characters[:MAX_CHARACTERS]:
             name = character.get("name") or "character"
             prompt = character.get("prompt") or ""
-            text = (
-                f"Create a full portrait illustration of {name}. "
-                "No text on the image, no borders, not a cover, not a comic panel. "
-                f"{style_line} Also follow: {SYSTEM_INSTRUCTIONS} Description: {prompt}"
+            interaction = self._interact(
+                model=self.image_model,
+                input=(
+                    f"Create an illustration for {name} following this description: {prompt}"
+                ),
+                previous_interaction_id=self._tls.image_interaction_id,
             )
-            blob, response_id = self._image(text, aspect_ratio="9:16", max_tokens=1024)
-            self._tls.image_interaction_id = response_id
-            images.append(blob)
+            self._tls.image_interaction_id = interaction.id
+            images.append(image_bytes_from_interaction(interaction))
         self._tls.portraits = list(images)
         return images
 
     def chapters(self) -> list[dict]:
-        self._require_text_session()
-        prompt = (
-            "Now, for each chapter of the book, give me a prompt to illustrate what "
-            "happens in it. It should be a single image, not a multi-tiled page. Be "
-            "very descriptive, especially of the characters. Remember to tell their "
-            "name and to reuse the character prompts if they appear in the images. "
-            "Also list all characters who appear in it."
+        previous = self._require_text_session()
+        interaction = self._interact(
+            model=self.text_model,
+            input=CHAPTERS_PROMPT,
+            previous_interaction_id=previous,
+            response_format=PROMPT_LIST_FORMAT,
         )
-        reply, response_id = self._chat_next(
-            prompt,
-            response_format=JSON_SCHEMA_FORMAT,
-            max_tokens=2048,
-        )
-        self._tls.interaction_id = response_id
-        return _parse_prompt_list(reply, limit=MAX_CHAPTERS)
+        self._tls.interaction_id = interaction.id
+        return _parse_prompt_list(_interaction_text(interaction), limit=MAX_CHAPTERS)
 
     def illustrations(
         self,
@@ -323,167 +356,125 @@ class RealGeminiClient:
     ) -> list[bytes]:
         self._ensure_session()
         refs = portraits if portraits is not None else list(getattr(self._tls, "portraits", []) or [])
-        style = getattr(self._tls, "style", None) or ""
-        style_line = f'Follow this style: "{style}"' if style else ""
+        previous = getattr(self._tls, "image_interaction_id", None)
+        setup = self._interact(
+            model=self.image_model,
+            input=CHAPTER_SETUP_PROMPT,
+            previous_interaction_id=previous,
+        )
+        self._tls.image_interaction_id = setup.id
         images: list[bytes] = []
         for chapter in chapters[:MAX_CHAPTERS]:
             name = chapter.get("name") or "chapter"
             prompt = chapter.get("prompt") or ""
             text = (
                 f"Create an illustration for {name} using the previously generated "
-                "characters so they stay visually consistent, but feel free to change "
-                "their position. Use the provided images as references of what the "
-                "characters look like. No text, no borders, full scene, not a comic "
-                f"page. {style_line} Also follow: {SYSTEM_INSTRUCTIONS} "
-                f"Description: {prompt}"
+                f"characters following this description: {prompt}"
             )
-            blob, response_id = self._image(text, references=refs, max_tokens=1024)
-            self._tls.image_interaction_id = response_id
-            images.append(blob)
+            interaction = self._interact(
+                model=self.image_model,
+                input=_illustration_input(text, refs),
+                previous_interaction_id=self._tls.image_interaction_id,
+            )
+            self._tls.image_interaction_id = interaction.id
+            images.append(image_bytes_from_interaction(interaction))
         return images
 
     def _ensure_session(self) -> None:
-        if not hasattr(self._tls, "text_messages"):
+        if not hasattr(self._tls, "file_id"):
             self.load_session({})
 
-    def _require_text_session(self) -> None:
+    def _require_text_session(self) -> str:
         self._ensure_session()
-        if not getattr(self._tls, "text_messages", None):
+        previous = getattr(self._tls, "interaction_id", None)
+        if not previous:
             raise GeminiError(
                 "No text session. The book must be sent once (send_book) before later steps."
             )
+        return previous
 
-    def _chat_next(
-        self,
-        prompt: str,
-        *,
-        response_format: dict[str, Any] | None = None,
-        max_tokens: int = 2048,
-    ) -> tuple[str, str]:
-        history = list(self._tls.text_messages)
-        history.append({"role": "user", "content": prompt})
-        reply, response_id = self._chat(
-            history,
-            model=self.text_model,
-            response_format=response_format,
-            max_tokens=max_tokens,
-        )
-        history.append({"role": "assistant", "content": reply or ""})
-        self._tls.text_messages = history
-        return reply, response_id
+    def _upload_book(self, text: str) -> Any:
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".txt",
+                delete=False,
+                encoding="utf-8",
+            ) as tmp:
+                tmp.write(text)
+                tmp_path = tmp.name
+            try:
+                return self._sdk.files.upload(file=tmp_path)
+            except Exception as exc:
+                _reraise_gemini(exc)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
-    def _chat(
+    def _interact(
         self,
-        messages: list[dict[str, Any]],
         *,
         model: str,
+        input: Any,
+        previous_interaction_id: str | None = None,
         response_format: dict[str, Any] | None = None,
-        max_tokens: int = 2048,
-    ) -> tuple[str, str]:
-        body: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-        }
+    ) -> Any:
+        kwargs: dict[str, Any] = {"model": model, "input": input}
+        if previous_interaction_id:
+            kwargs["previous_interaction_id"] = previous_interaction_id
         if response_format is not None:
-            body["response_format"] = response_format
-        data = self._request("/chat/completions", body)
-        reply = _text_from_chat(data)
-        return reply, str(data.get("id") or "openrouter:text")
-
-    def _image(
-        self,
-        prompt: str,
-        *,
-        aspect_ratio: str | None = None,
-        references: list[bytes] | None = None,
-        max_tokens: int = 1024,
-    ) -> tuple[bytes, str]:
-        body: dict[str, Any] = {
-            "model": self.image_model,
-            "prompt": prompt,
-            "n": 1,
-            "output_format": "png",
-            "max_tokens": max_tokens,
-        }
-        if aspect_ratio:
-            body["aspect_ratio"] = aspect_ratio
-        if references:
-            body["input_references"] = [
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{base64.b64encode(blob).decode('ascii')}"
-                    },
-                }
-                for blob in references
-            ]
-        data = self._request("/images", body)
-        return image_bytes_from_openrouter(data), str(data.get("id") or "openrouter:image")
-
-    def _headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "http://127.0.0.1:5173",
-            "X-Title": "Book Illustration Studio",
-        }
-
-    def _request(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        url = f"{self.base_url}{path}"
+            kwargs["response_format"] = response_format
         try:
-            response = self._http.post(url, headers=self._headers(), json=body)
+            interaction = self._sdk.interactions.create(**kwargs)
         except Exception as exc:
-            _reraise_openrouter(exc)
-        status = getattr(response, "status_code", None)
-        payload = _response_json(response)
-        if status in {401, 403}:
-            raise GeminiConfigError(
-                "OPENROUTER_API_KEY is missing or invalid. Set it in .env "
-                "(https://openrouter.ai/keys)."
-            )
-        if status is not None and int(status) >= 400:
-            raise GeminiError(
-                f"OpenRouter request failed (no automatic retry): {_error_message(payload, response)}"
-            )
-        if not isinstance(payload, dict):
-            raise GeminiError("OpenRouter returned a non-JSON body.")
-        return payload
+            _reraise_gemini(exc)
+        if interaction is None or not getattr(interaction, "id", None):
+            raise GeminiError("Gemini returned no interaction id.")
+        return interaction
+
+
+def _illustration_input(text: str, portraits: list[bytes]) -> Any:
+    if not portraits:
+        return text
+    parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    for blob in portraits:
+        parts.append(
+            {
+                "type": "image",
+                "data": base64.b64encode(blob).decode("ascii"),
+                "mime_type": "image/png",
+            }
+        )
+    return parts
 
 
 def _normalize_model(value: str | None, default: str) -> str:
     raw = (value or "").strip() or default
-    if "/" not in raw:
-        return f"google/{raw}"
+    if raw.startswith("google/"):
+        raw = raw[len("google/") :]
     return raw
 
 
-def _response_json(response: Any) -> Any:
-    parser = getattr(response, "json", None)
-    if callable(parser):
-        try:
-            return parser()
-        except Exception:
-            return None
-    return None
-
-
-def _error_message(payload: Any, response: Any) -> str:
-    if isinstance(payload, dict):
-        err = payload.get("error")
-        if isinstance(err, dict) and err.get("message"):
-            return str(err["message"])
-        if isinstance(err, str) and err:
-            return err
-        if payload.get("message"):
-            return str(payload["message"])
-    text = getattr(response, "text", None)
+def _interaction_text(interaction: Any) -> str:
+    text = getattr(interaction, "output_text", None)
     if isinstance(text, str) and text.strip():
-        return text.strip()[:500]
-    return f"HTTP {getattr(response, 'status_code', '?')}"
+        return text.strip()
+    steps = getattr(interaction, "steps", None) or []
+    for step in reversed(list(steps)):
+        for part in reversed(list(getattr(step, "content", None) or [])):
+            chunk = getattr(part, "text", None)
+            if chunk is None and isinstance(part, dict):
+                chunk = part.get("text")
+            if isinstance(chunk, str) and chunk.strip():
+                return chunk.strip()
+    return ""
 
 
-def _reraise_openrouter(exc: BaseException) -> NoReturn:
+def _reraise_gemini(exc: BaseException) -> NoReturn:
     message = str(exc)
     lowered = message.lower()
     status = getattr(exc, "status_code", None) or getattr(exc, "code", None) or getattr(exc, "status", None)
@@ -492,48 +483,15 @@ def _reraise_openrouter(exc: BaseException) -> NoReturn:
         or "api key" in lowered
         or "unauthorized" in lowered
         or "no auth credentials" in lowered
+        or "invalid api key" in lowered
+        or "api_key_invalid" in lowered
     )
     if invalid_key:
         raise GeminiConfigError(
-            "OPENROUTER_API_KEY is missing or invalid. Set it in .env "
-            "(https://openrouter.ai/keys)."
+            "GEMINI_API_KEY is missing or invalid. Set it in .env "
+            "(https://aistudio.google.com/apikey)."
         ) from exc
-    raise GeminiError(f"OpenRouter request failed (no automatic retry): {exc}") from exc
-
-
-def _text_from_chat(data: dict[str, Any]) -> str:
-    choices = data.get("choices") or []
-    if not choices:
-        return ""
-    message = (choices[0] or {}).get("message") or {}
-    content = message.get("content")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        chunks: list[str] = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") in {None, "text"}:
-                text = part.get("text")
-                if isinstance(text, str) and text.strip():
-                    chunks.append(text.strip())
-        return "\n".join(chunks)
-    return ""
-
-
-def image_bytes_from_openrouter(data: dict[str, Any]) -> bytes:
-    rows = data.get("data") or []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        blob = _decode_image_field(row.get("b64_json") or row.get("b64"))
-        if blob:
-            return blob
-        url = row.get("url")
-        if isinstance(url, str) and url.startswith("data:"):
-            blob = _decode_image_field(url)
-            if blob:
-                return blob
-    raise GeminiError("OpenRouter returned no image bytes for this illustration.")
+    raise GeminiError(f"Gemini request failed (no automatic retry): {exc}") from exc
 
 
 def image_bytes_from_interaction(interaction: Any) -> bytes:
@@ -578,21 +536,21 @@ def _decode_image_field(data: Any) -> bytes | None:
 
 def _parse_prompt_list(raw: str, *, limit: int) -> list[dict]:
     if not (raw or "").strip():
-        raise GeminiError("OpenRouter returned empty structured output.")
+        raise GeminiError("Gemini returned empty structured output.")
     cleaned = raw.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
     cleaned = re.sub(r"\s*```$", "", cleaned)
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        raise GeminiError(f"OpenRouter returned invalid JSON: {exc}") from exc
+        raise GeminiError(f"Gemini returned invalid JSON: {exc}") from exc
     if isinstance(parsed, dict):
         for key in ("items", "characters", "chapters"):
             if isinstance(parsed.get(key), list):
                 parsed = parsed[key]
                 break
     if not isinstance(parsed, list):
-        raise GeminiError("OpenRouter JSON was not a list of {name, prompt} objects.")
+        raise GeminiError("Gemini JSON was not a list of {name, prompt} objects.")
     items: list[dict] = []
     for entry in parsed[:limit]:
         if not isinstance(entry, dict):
@@ -602,5 +560,5 @@ def _parse_prompt_list(raw: str, *, limit: int) -> list[dict]:
         if name and prompt:
             items.append({"name": name, "prompt": prompt})
     if not items:
-        raise GeminiError("OpenRouter JSON had no usable name/prompt entries.")
+        raise GeminiError("Gemini JSON had no usable name/prompt entries.")
     return items

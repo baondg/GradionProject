@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manual test for RealGeminiClient via OpenRouter. Run from backend/:
+"""Manual test for RealGeminiClient via Gemini. Run from backend/:
 
     ../.venv/bin/python test_gemini_manual.py
 """

@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, Request
@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.gemini import FakeGeminiClient, GeminiConfigError, RealGeminiClient
-from app.state import STEPS, can_claim, next_step, to_view
+from app.state import STEPS, attempts_view, can_claim, next_step, to_view
 from app.storage import Storage
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -38,6 +38,13 @@ class IdentifyIn(BaseModel):
     email: str
 
 
+class AttemptOut(BaseModel):
+    step: Literal["style", "characters", "portraits", "chapters", "illustrations"]
+    at: str
+    outcome: Literal["success", "failed"]
+    message: str | None = None
+
+
 class UnconfiguredGemini:
     def load_session(
         self,
@@ -51,26 +58,26 @@ class UnconfiguredGemini:
         return {"file_id": None, "interaction_id": None}
 
     def send_book(self, text: str) -> None:
-        raise RuntimeError("OPENROUTER_API_KEY is missing. Copy .env.example to .env.")
+        raise RuntimeError("GEMINI_API_KEY is missing. Copy .env.example to .env.")
 
     def style(self, user_style: str | None = None) -> str:
-        raise RuntimeError("OPENROUTER_API_KEY is missing. Copy .env.example to .env.")
+        raise RuntimeError("GEMINI_API_KEY is missing. Copy .env.example to .env.")
 
     def characters(self) -> list[dict]:
-        raise RuntimeError("OPENROUTER_API_KEY is missing. Copy .env.example to .env.")
+        raise RuntimeError("GEMINI_API_KEY is missing. Copy .env.example to .env.")
 
     def portraits(self, characters: list[dict]) -> list[bytes]:
-        raise RuntimeError("OPENROUTER_API_KEY is missing. Copy .env.example to .env.")
+        raise RuntimeError("GEMINI_API_KEY is missing. Copy .env.example to .env.")
 
     def chapters(self) -> list[dict]:
-        raise RuntimeError("OPENROUTER_API_KEY is missing. Copy .env.example to .env.")
+        raise RuntimeError("GEMINI_API_KEY is missing. Copy .env.example to .env.")
 
     def illustrations(
         self,
         chapters: list[dict],
         portraits: list[bytes] | None = None,
     ) -> list[bytes]:
-        raise RuntimeError("OPENROUTER_API_KEY is missing. Copy .env.example to .env.")
+        raise RuntimeError("GEMINI_API_KEY is missing. Copy .env.example to .env.")
 
 
 def _truthy(value: str | None) -> bool:
@@ -78,8 +85,8 @@ def _truthy(value: str | None) -> bool:
 
 
 def default_gemini() -> Any:
-    # Same public methods as RealGeminiClient. Flip this off once OpenRouter
-    # has credit; routes, claim/lock, and session dump stay unchanged.
+    # Same public methods as RealGeminiClient. Flip this off to use the
+    # notebook Files + Interactions adapter; routes and session dump stay unchanged.
     if _truthy(os.environ.get("USE_FAKE_GEMINI")):
         return FakeGeminiClient()
     try:
@@ -140,6 +147,9 @@ def _detail_view(doc: dict[str, Any], boot_id: str, book_text: str) -> dict[str,
         }
         for index, chapter in enumerate(doc.get("chapters") or [])
     ]
+    view["attempts"] = [
+        AttemptOut.model_validate(row).model_dump() for row in attempts_view(doc)
+    ]
     return view
 
 
@@ -154,6 +164,27 @@ def _persist_gemini_session(doc: dict[str, Any], gemini: Any) -> dict[str, Any]:
     return doc
 
 
+def _append_attempt(
+    doc: dict[str, Any],
+    *,
+    step: str,
+    outcome: str,
+    message: str | None,
+) -> None:
+    rows = doc.setdefault("attempts", [])
+    if not isinstance(rows, list):
+        rows = []
+        doc["attempts"] = rows
+    rows.append(
+        {
+            "step": step,
+            "at": _now(),
+            "outcome": outcome,
+            "message": message,
+        }
+    )
+
+
 def _finish_ok(doc: dict[str, Any], claimed_boot: str, step: str) -> dict[str, Any]:
     if doc.get("run_boot_id") != claimed_boot:
         return doc
@@ -162,14 +193,22 @@ def _finish_ok(doc: dict[str, Any], claimed_boot: str, step: str) -> dict[str, A
     doc["run_boot_id"] = None
     doc["run_started_at"] = None
     doc["error"] = None
+    _append_attempt(doc, step=step, outcome="success", message=None)
     return doc
 
 
-def _finish_fail(doc: dict[str, Any], claimed_boot: str, exc: BaseException) -> dict[str, Any]:
+def _finish_fail(
+    doc: dict[str, Any],
+    claimed_boot: str,
+    exc: BaseException,
+    step: str,
+) -> dict[str, Any]:
     if doc.get("run_boot_id") != claimed_boot:
         return doc
+    message = str(exc)
     doc["run"] = "failed"
-    doc["error"] = {"code": "gemini_error", "message": str(exc)}
+    doc["error"] = {"code": "gemini_error", "message": message}
+    _append_attempt(doc, step=step, outcome="failed", message=message)
     return doc
 
 
@@ -400,7 +439,7 @@ def create_app(
         except Exception as exc:  # noqa: BLE001 — step failure is a user-visible error
             storage.update_project(
                 project_id,
-                lambda d: _finish_fail(d, claimed_boot, exc),
+                lambda d: _finish_fail(d, claimed_boot, exc, step),
             )
 
     @app.get("/api/health")

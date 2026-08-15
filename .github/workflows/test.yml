@@ -1,0 +1,42 @@
+name: test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install backend
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/pip install -U pip
+          backend/.venv/bin/pip install -e "backend[dev]"
+
+      - name: Install frontend
+        run: npm ci
+        working-directory: frontend
+
+      - name: pytest
+        run: .venv/bin/pytest
+        working-directory: backend
+
+      - name: vitest
+        run: npm test
+        working-directory: frontend

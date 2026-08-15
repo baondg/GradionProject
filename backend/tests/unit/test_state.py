@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.state import can_claim, next_step, to_view
+from app.state import attempts_view, can_claim, next_step, to_view
 
 LIVE_BOOT = "boot-live"
 STALE_BOOT = "boot-old"
@@ -222,7 +222,12 @@ def test_to_view_done_project() -> None:
 
 def test_to_view_does_not_expose_disk_only_fields() -> None:
     view = to_view(
-        make_doc(run="running", run_boot_id=LIVE_BOOT, completed_step="style"),
+        make_doc(
+            run="running",
+            run_boot_id=LIVE_BOOT,
+            completed_step="style",
+            attempts=[{"step": "style", "at": "t", "outcome": "success", "message": None}],
+        ),
         LIVE_BOOT,
     )
 
@@ -230,3 +235,8 @@ def test_to_view_does_not_expose_disk_only_fields() -> None:
     assert "gemini" not in view
     assert "run_started_at" not in view
     assert "user_email" not in view
+    assert "attempts" not in view
+
+
+def test_attempts_view_missing_is_empty() -> None:
+    assert attempts_view(make_doc()) == []

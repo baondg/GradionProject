@@ -42,6 +42,7 @@ export function detail(
     style_source: null,
     characters: [],
     chapters: [],
+    attempts: [],
     ...extra,
     action,
   }
